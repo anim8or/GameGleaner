@@ -1,177 +1,147 @@
-# GameGleaner
-# A Python script to scrape game data from Itch.io, including titles, URLs, authors, prices, and thumbnails.
-
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
 import os
 import re
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from datetime import date
 
-# Base URL for Itch.io, used for constructing absolute URLs from relative paths.
+# ------------------------
+# Configuration
+# ------------------------
 BASE_URL = "https://itch.io"
+DATA_DIR = "data"
+THUMB_DIR = os.path.join(DATA_DIR, "thumbnails")
 
+LISTINGS = {
+    "popular": "https://itch.io/games/popular",
+    "top_sellers": "https://itch.io/games/top-sellers",
+}
 
-def download_thumbnail(thumbnail_url: str, title: str, scrape_date: str) -> str | None:
-    """
-    Downloads a thumbnail image from a given URL and saves it to a local directory.
+PAGES_PER_LISTING = 2  # number of pages to scrape per listing
 
-    Args:
-        thumbnail_url (str): The URL of the thumbnail image to download.
-        title (str): The title of the game, used to create a safe filename.
-        scrape_date (str): The date of the scrape, used to prefix the filename for organization.
-
-    Returns:
-        str | None: The local file path of the downloaded thumbnail if successful,
-                    otherwise None.
-    """
+# ------------------------
+# Thumbnail downloader
+# ------------------------
+def download_thumbnail(thumbnail_url, title, scrape_date):
     if not thumbnail_url:
         return None
 
-    # Define the directory for saving thumbnails and create it if it doesn't exist.
-    thumb_dir = os.path.join("data", "thumbnails")
-    os.makedirs(thumb_dir, exist_ok=True)
+    os.makedirs(THUMB_DIR, exist_ok=True)
 
-    # Sanitize the title to create a valid filename.
-    # Replaces non-alphanumeric characters with underscores and truncates to 50 characters.
     safe_title = re.sub(r"[^a-zA-Z0-9_-]", "_", title)[:50]
-    # Extract the file extension from the URL, handling potential query parameters.
     ext = thumbnail_url.split(".")[-1].split("?")[0]
-    # Construct the full filename.
     filename = f"{scrape_date}_{safe_title}.{ext}"
-    filepath = os.path.join(thumb_dir, filename)
+    filepath = os.path.join(THUMB_DIR, filename)
 
     try:
-        # Send a GET request to download the thumbnail, with a 10-second timeout.
         r = requests.get(thumbnail_url, timeout=10)
-        # Check if the request was successful (status code 200).
         if r.status_code == 200:
-            # Write the content of the response (image data) to the file.
             with open(filepath, "wb") as f:
                 f.write(r.content)
             return filepath
-        else:
-            print(f"Failed to download thumbnail for {title}: Status code {r.status_code}")
-    except requests.exceptions.RequestException as e:
-        # Catch specific request exceptions for better error handling.
-        print(f"Failed to download thumbnail for {title} (Request Error): {e}")
     except Exception as e:
-        # Catch any other unexpected errors during download.
-        print(f"Failed to download thumbnail for {title} (General Error): {e}")
+        print(f"Thumbnail failed for {title}: {e}")
+
     return None
 
+# ------------------------
+# Price helpers
+# ------------------------
+def parse_price(price_text):
+    if not price_text:
+        return None, None, True
 
-def scrape_listing_page(url: str, scrape_date: str) -> list[dict]:
-    """
-    Scrapes a single listing page on Itch.io to extract game details.
+    text = price_text.lower()
 
-    Args:
-        url (str): The URL of the Itch.io listing page (e.g., top sellers, popular).
-        scrape_date (str): The date of the scrape, used for thumbnail filenames.
+    if "free" in text:
+        return "Free", None, True
 
-    Returns:
-        list[dict]: A list of dictionaries, where each dictionary contains
-                    details for one game found on the page.
-    """
-    print(f"Scraping: {url}")
-    try:
-        response = requests.get(url, timeout=15) # Add timeout for robustness
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching page {url}: {e}")
-        return []
+    currency_match = re.search(r"[£$€]", price_text)
+    currency = currency_match.group(0) if currency_match else None
 
+    return price_text.strip(), currency, False
+
+# ------------------------
+# Scrape one listing page
+# ------------------------
+def scrape_listing_page(url, listing_type, page_num, scrape_date):
+    response = requests.get(url, timeout=10)
     soup = BeautifulSoup(response.text, "html.parser")
 
     games = []
-    # Select all game cells on the page.
-    items = soup.select(".game_cell")
-    for item in items:
-        game_data = {}
 
-        # Extract game title.
-        title_element = item.select_one(".game_title a")
-        game_data["title"] = title_element.text.strip() if title_element else "N/A"
+    for item in soup.select(".game_cell"):
+        title_tag = item.select_one(".game_title")
+        link_tag = item.select_one("a.game_link")
 
-        # Extract game URL.
-        game_url_relative = title_element["href"] if title_element and "href" in title_element.attrs else ""
-        game_data["url"] = urljoin(BASE_URL, game_url_relative) if game_url_relative else "N/A"
+        if not title_tag or not link_tag:
+            continue
 
-        # Extract author/developer name.
-        author_element = item.select_one(".game_author a")
-        game_data["author"] = author_element.text.strip() if author_element else "N/A"
+        title = title_tag.text.strip()
+        game_url = urljoin(BASE_URL, link_tag["href"])
 
-        # Extract game price.
-        price_element = item.select_one(".price")
-        game_data["price"] = price_element.text.strip() if price_element else "Free" # Default to 'Free' if no price found
+        author_tag = item.select_one(".game_author")
+        author = author_tag.text.strip() if author_tag else None
 
-        # Extract thumbnail URL and download it.
-        thumbnail_element = item.select_one(".game_thumb img")
-        thumbnail_url = thumbnail_element["data-lazy_src"] if thumbnail_element and "data-lazy_src" in thumbnail_element.attrs else (
-            thumbnail_element["src"] if thumbnail_element and "src" in thumbnail_element.attrs else None
+        price_tag = item.select_one(".price")
+        price_text = price_tag.text.strip() if price_tag else None
+        price, currency, is_free = parse_price(price_text)
+
+        thumb_img = item.select_one(".game_thumb img")
+        thumbnail_url = (
+            urljoin(BASE_URL, thumb_img["src"])
+            if thumb_img and thumb_img.get("src")
+            else None
         )
-        game_data["thumbnail_path"] = download_thumbnail(thumbnail_url, game_data["title"], scrape_date)
 
-        # Add the scrape date to the record.
-        game_data["scrape_date"] = scrape_date
+        thumbnail_path = download_thumbnail(thumbnail_url, title, scrape_date)
 
-        games.append(game_data)
+        games.append({
+            "scrape_date": scrape_date,
+            "listing_type": listing_type,
+            "source_page": f"{listing_type}_page_{page_num}",
+            "title": title,
+            "url": game_url,
+            "author": author,
+            "price": price,
+            "currency": currency,
+            "is_free": is_free,
+            "thumbnail_url": thumbnail_url,
+            "thumbnail_path": thumbnail_path,
+        })
+
     return games
 
-
+# ------------------------
+# Main scraper runner
+# ------------------------
 def run_scraper():
-    """
-    Orchestrates the entire scraping process.
-    It fetches data from multiple Itch.io listing pages, processes it,
-    downloads thumbnails, and saves the combined data to a CSV file.
-    """
-    # Get today's date to use for folder naming and data timestamping.
     scrape_date = str(date.today())
-    # Create the base 'data' directory if it doesn't exist.
-    os.makedirs("data", exist_ok=True)
-    # Define the path for the combined CSV file.
-    combined_csv_path = os.path.join("data", "combined.csv")
+    os.makedirs(DATA_DIR, exist_ok=True)
 
+    combined_csv = os.path.join(DATA_DIR, "combined.csv")
     all_games = []
 
-    # Define the pages to scrape with their respective labels and URLs.
-    pages = {
-        "Top Sellers": "https://itch.io/games/top-sellers",
-        "Popular": "https://itch.io/games/popular"
-    }
+    for listing_type, base_url in LISTINGS.items():
+        for page in range(1, PAGES_PER_LISTING + 1):
+            url = f"{base_url}?page={page}"
+            print(f"Scraping {url}")
+            all_games.extend(
+                scrape_listing_page(url, listing_type, page, scrape_date)
+            )
 
-    # Iterate through each defined category and multiple pages within each category.
-    for label, page_url in pages.items():
-        print(f"--- Scraping {label} games ---")
-        # Scrape the first 2 pages for each category.
-        for page in range(1, 3):
-            # Construct the URL for the specific page number.
-            url = f"{page_url}?page={page}"
-            # Extend the overall list of games with results from the current page.
-            all_games.extend(scrape_listing_page(url, scrape_date))
+    new_df = pd.DataFrame(all_games)
 
-    # Convert the list of game dictionaries into a Pandas DataFrame.
-    df = pd.DataFrame(all_games)
+    if os.path.exists(combined_csv):
+        old_df = pd.read_csv(combined_csv)
+        new_df = pd.concat([old_df, new_df], ignore_index=True)
 
-    # Handle appending to an existing combined CSV file to avoid duplicates.
-    if os.path.exists(combined_csv_path):
-        # Read the existing data.
-        old_df = pd.read_csv(combined_csv_path)
-        # Concatenate new data with old data.
-        # Use `drop_duplicates` based on a combination of title and URL to prevent adding the same game multiple times
-        # across different scrapes, assuming title+url uniquely identifies a game.
-        df = pd.concat([old_df, df], ignore_index=True).drop_duplicates(subset=["title", "url"], keep="first")
-        print(f"Appended new data to existing {combined_csv_path}. Total records: {len(df)}")
-    else:
-        print(f"Created new {combined_csv_path}. Total records: {len(df)}")
+    new_df.to_csv(combined_csv, index=False)
+    print(f"Scrape complete — {len(all_games)} new games added")
 
-    # Save the DataFrame to a CSV file.
-    df.to_csv(combined_csv_path, index=False)
-    print("Scrape complete. Data saved to data/combined.csv")
-
-
+# ------------------------
+# Entry point
+# ------------------------
 if __name__ == "__main__":
-    # This block ensures that `run_scraper()` is called only when the script is executed directly,
-    # not when it's imported as a module into another script.
     run_scraper()
