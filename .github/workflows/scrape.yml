@@ -1,8 +1,8 @@
-name: GameGleaner Scraper
+name: Monthly Itch Scrape
 
 on:
   schedule:
-    - cron: '0 8 * * *'  # Runs daily at 08:00 UTC
+    - cron: '0 0 1 * *'  # First day of every month
   workflow_dispatch:
 
 jobs:
@@ -13,27 +13,21 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v3
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: 3.11
+          python-version: '3.x'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas
-
-      - name: Create data directories
-        run: |
-          mkdir -p scraper/data/thumbnails
+        run: pip install requests beautifulsoup4 pandas
 
       - name: Run scraper
         run: python scraper/GameGleaner.py
 
-      - name: Commit and push results
+      - name: Commit scraped data
         run: |
+          git config --local user.email "action@github.com"
           git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add scraper/data/itch_games.csv scraper/data/thumbnails/
-          git commit -m "Update scraped game data [skip ci]" || echo "No changes to commit"
+          git add data/itch_games.csv thumbnails/
+          git commit -m "Monthly scrape $(date)" || echo "No changes"
           git push
