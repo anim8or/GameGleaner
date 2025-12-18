@@ -1,147 +1,125 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
 import os
 import re
-import requests
-import pandas as pd
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from datetime import date
+from datetime import datetime
 
-# ------------------------
-# Configuration
-# ------------------------
-BASE_URL = "https://itch.io"
-DATA_DIR = "data"
-THUMB_DIR = os.path.join(DATA_DIR, "thumbnails")
+# -----------------------------
+# CONFIG
+# -----------------------------
+BASE_DIR = "data"
+THUMB_DIR = os.path.join(BASE_DIR, "thumbnails")
+CSV_FILE = os.path.join(BASE_DIR, "itch_games.csv")
+os.makedirs(THUMB_DIR, exist_ok=True)
 
-LISTINGS = {
-    "popular": "https://itch.io/games/popular",
-    "top_sellers": "https://itch.io/games/top-sellers",
+POPULAR_URL = "https://itch.io/games/popular"
+TOP_SELLERS_URL = "https://itch.io/games/top-sellers"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
 }
 
-PAGES_PER_LISTING = 2  # number of pages to scrape per listing
-
-# ------------------------
-# Thumbnail downloader
-# ------------------------
-def download_thumbnail(thumbnail_url, title, scrape_date):
-    if not thumbnail_url:
-        return None
-
-    os.makedirs(THUMB_DIR, exist_ok=True)
-
-    safe_title = re.sub(r"[^a-zA-Z0-9_-]", "_", title)[:50]
-    ext = thumbnail_url.split(".")[-1].split("?")[0]
-    filename = f"{scrape_date}_{safe_title}.{ext}"
-    filepath = os.path.join(THUMB_DIR, filename)
-
+# -----------------------------
+# HELPER FUNCTIONS
+# -----------------------------
+def download_thumbnail(url, title):
+    ext = url.split('.')[-1].split('?')[0]
+    safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
+    path = os.path.join(THUMB_DIR, f"{datetime.today().strftime('%Y-%m-%d')}_{safe_title}.{ext}")
     try:
-        r = requests.get(thumbnail_url, timeout=10)
-        if r.status_code == 200:
-            with open(filepath, "wb") as f:
-                f.write(r.content)
-            return filepath
+        resp = requests.get(url, headers=HEADERS)
+        with open(path, "wb") as f:
+            f.write(resp.content)
+        return path
     except Exception as e:
-        print(f"Thumbnail failed for {title}: {e}")
+        print(f"Thumbnail download failed: {e}")
+        return ""
 
-    return None
+def parse_price(title_text, price_text=None):
+    """
+    Always separate price from title.
+    """
+    price = None
+    if price_text and price_text.strip():
+        price = price_text.strip()
+    else:
+        # fallback: parse from title if inline
+        match = re.search(r'(\$|£|€)\d+(\.\d{1,2})?', title_text)
+        if match:
+            price = match.group(0)
+            title_text = title_text.replace(price, "").strip()
+    is_free = price in (None, "", "Free")
+    return title_text, price, is_free
 
-# ------------------------
-# Price helpers
-# ------------------------
-def parse_price(price_text):
-    if not price_text:
-        return None, None, True
+def scrape_page(url, listing_type):
+    page_num = 1
+    results = []
 
-    text = price_text.lower()
+    while url:
+        print(f"Scraping {listing_type} page {page_num}: {url}")
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    if "free" in text:
-        return "Free", None, True
+        for game in soup.select(".game_cell"):
+            title_tag = game.select_one(".title .game_title")
+            author_tag = game.select_one(".game_author")
+            price_tag = game.select_one(".price")
+            thumb_tag = game.select_one("img.cover_image")
 
-    currency_match = re.search(r"[£$€]", price_text)
-    currency = currency_match.group(0) if currency_match else None
+            if not title_tag:
+                continue
 
-    return price_text.strip(), currency, False
+            title_raw = title_tag.text.strip()
+            author = author_tag.text.strip() if author_tag else ""
+            price_text = price_tag.text.strip() if price_tag else None
+            title, price, is_free = parse_price(title_raw, price_text)
 
-# ------------------------
-# Scrape one listing page
-# ------------------------
-def scrape_listing_page(url, listing_type, page_num, scrape_date):
-    response = requests.get(url, timeout=10)
-    soup = BeautifulSoup(response.text, "html.parser")
+            thumb_url = thumb_tag["src"] if thumb_tag else ""
+            thumb_path = download_thumbnail(thumb_url, title) if thumb_url else ""
 
-    games = []
+            results.append({
+                "title": title,
+                "url": game.select_one("a")["href"],
+                "author": author,
+                "price": price,
+                "currency": price[0] if price and price[0] in "$£€" else "",
+                "is_free": is_free,
+                "thumbnail_url": thumb_url,
+                "thumbnail_path": thumb_path,
+                "scrape_date": datetime.today().strftime("%Y-%m-%d"),
+                "listing_type": listing_type,
+                "source_page": f"{listing_type}_page_{page_num}"
+            })
 
-    for item in soup.select(".game_cell"):
-        title_tag = item.select_one(".game_title")
-        link_tag = item.select_one("a.game_link")
+        # Check for next page
+        next_btn = soup.select_one(".next_page")
+        url = next_btn["href"] if next_btn else None
+        page_num += 1
 
-        if not title_tag or not link_tag:
-            continue
+    return results
 
-        title = title_tag.text.strip()
-        game_url = urljoin(BASE_URL, link_tag["href"])
+# -----------------------------
+# MAIN SCRAPER
+# -----------------------------
+all_results = []
 
-        author_tag = item.select_one(".game_author")
-        author = author_tag.text.strip() if author_tag else None
+# Scrape popular
+all_results += scrape_page(POPULAR_URL, "popular")
 
-        price_tag = item.select_one(".price")
-        price_text = price_tag.text.strip() if price_tag else None
-        price, currency, is_free = parse_price(price_text)
+# Scrape top sellers
+all_results += scrape_page(TOP_SELLERS_URL, "top_sellers")
 
-        thumb_img = item.select_one(".game_thumb img")
-        thumbnail_url = (
-            urljoin(BASE_URL, thumb_img["src"])
-            if thumb_img and thumb_img.get("src")
-            else None
-        )
+# -----------------------------
+# SAVE TO CSV
+# -----------------------------
+df = pd.DataFrame(all_results)
 
-        thumbnail_path = download_thumbnail(thumbnail_url, title, scrape_date)
+# If CSV exists, append new data and deduplicate by URL
+if os.path.exists(CSV_FILE):
+    old_df = pd.read_csv(CSV_FILE)
+    df = pd.concat([old_df, df])
+    df.drop_duplicates(subset=["url", "scrape_date"], inplace=True)
 
-        games.append({
-            "scrape_date": scrape_date,
-            "listing_type": listing_type,
-            "source_page": f"{listing_type}_page_{page_num}",
-            "title": title,
-            "url": game_url,
-            "author": author,
-            "price": price,
-            "currency": currency,
-            "is_free": is_free,
-            "thumbnail_url": thumbnail_url,
-            "thumbnail_path": thumbnail_path,
-        })
-
-    return games
-
-# ------------------------
-# Main scraper runner
-# ------------------------
-def run_scraper():
-    scrape_date = str(date.today())
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    combined_csv = os.path.join(DATA_DIR, "combined.csv")
-    all_games = []
-
-    for listing_type, base_url in LISTINGS.items():
-        for page in range(1, PAGES_PER_LISTING + 1):
-            url = f"{base_url}?page={page}"
-            print(f"Scraping {url}")
-            all_games.extend(
-                scrape_listing_page(url, listing_type, page, scrape_date)
-            )
-
-    new_df = pd.DataFrame(all_games)
-
-    if os.path.exists(combined_csv):
-        old_df = pd.read_csv(combined_csv)
-        new_df = pd.concat([old_df, new_df], ignore_index=True)
-
-    new_df.to_csv(combined_csv, index=False)
-    print(f"Scrape complete — {len(all_games)} new games added")
-
-# ------------------------
-# Entry point
-# ------------------------
-if __name__ == "__main__":
-    run_scraper()
+df.to_csv(CSV_FILE, index=False)
+print(f"Saved {len(df)} records to {CSV_FILE}")
