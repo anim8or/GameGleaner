@@ -1,3 +1,12 @@
 - name: Install dependencies
   run: |
     pip install requests beautifulsoup4 pandas
+    
+- uses: actions/checkout@v3
+- uses: actions/setup-python@v4
+- run: pip install requests beautifulsoup4 pandas
+- run: python scraper/scrape_itch.py
+- run: |
+    git add -A
+    git commit -m "Monthly scrape $(date)" || echo "No changes"
+    git push
