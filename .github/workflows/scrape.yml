@@ -1,33 +1,43 @@
-name: Monthly Itch Scrape
+name: Itch.io Scraper
 
 on:
   schedule:
-    - cron: '0 0 1 * *'  # First day of every month
-  workflow_dispatch:
+    - cron: '0 0 1 * *'  # Runs monthly at midnight UTC
+  workflow_dispatch:      # Allows manual trigger
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.x'
+          python-version: 3.11
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 pandas
+        run: |
+          pip install requests beautifulsoup4 pandas
 
       - name: Run scraper
-        run: python scraper/GameGleaner.py
-
-      - name: Commit scraped data
         run: |
-          git config --local user.email "action@github.com"
+          python scraper/GameGleaner.py
+
+      - name: Commit and push results
+        run: |
           git config --local user.name "github-actions[bot]"
-          git add data/itch_games.csv thumbnails/
-          git commit -m "Monthly scrape $(date)" || echo "No changes"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/itch_games.csv data/thumbnails/
+          git commit -m "Monthly scrape $(date)" || echo "No changes to commit"
           git push
+
+      - name: Upload artifacts (optional)
+        uses: actions/upload-artifact@v3
+        with:
+          name: itch-scrape-data
+          path: |
+            data/itch_games.csv
+            data/thumbnails/
