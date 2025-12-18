@@ -30,7 +30,11 @@ jobs:
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/itch_games.csv thumbnails/
+          git add data/itch_games.csv
+          # Add thumbnails only if they exist
+          if [ -d data/thumbnails ] && [ "$(ls -A data/thumbnails)" ]; then
+            git add data/thumbnails/
+          fi
           git commit -m "Monthly scrape $(date)" || echo "No changes to commit"
           git push
 
@@ -40,4 +44,4 @@ jobs:
           name: itch-scraper-data
           path: |
             data/itch_games.csv
-            thumbnails/
+            data/thumbnails/
