@@ -1,101 +1,89 @@
-# scraper/GameGleaner.py
-import requests
-import pandas as pd
 import os
+import csv
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
-from urllib.parse import urlparse
 
-# ---------- CONFIG ----------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-THUMBNAIL_DIR = os.path.join(BASE_DIR, "data", "thumbnails")
-CSV_FILE = os.path.join(BASE_DIR, "data", "itch_games.csv")
+# --- Paths ---
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR = os.path.join(REPO_ROOT, "data")
+THUMB_DIR = os.path.join(REPO_ROOT, "thumbnails")
 
-os.makedirs(THUMBNAIL_DIR, exist_ok=True)
-SCRAPE_DATE = datetime.today().strftime("%Y-%m-%d")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(THUMB_DIR, exist_ok=True)
 
-LISTINGS = [
-    {"type": "popular", "url": "https://itch.io/games/popular?page={}&format=json"},
-    {"type": "top_sellers", "url": "https://itch.io/games/top-sellers?page={}&format=json"}
-]
+CSV_PATH = os.path.join(DATA_DIR, "itch_games.csv")
 
-# ---------- FUNCTIONS ----------
-def download_thumbnail(url, title):
-    if not url:
-        return ""
-    filename = f"{SCRAPE_DATE}_{title}".replace(" ", "_").replace("/", "_")
-    ext = os.path.splitext(urlparse(url).path)[1]
-    filepath = os.path.join(THUMBNAIL_DIR, f"{filename}{ext}")
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        with open(filepath, "wb") as f:
-            f.write(r.content)
-        return filepath
-    except Exception as e:
-        print(f"Failed to download thumbnail for {title}: {e}")
-        return ""
+# --- URLs ---
+POPULAR_URL = "https://itch.io/games/popular"
+TOP_SELLERS_URL = "https://itch.io/games/top-sellers"
 
-def scrape_listing(listing_type, url_template):
+# --- Scraper functions ---
+def scrape_page(url, listing_type):
+    print(f"Scraping {listing_type} page: {url}")
     results = []
-    page = 1
-    while True:
-        url = url_template.format(page)
-        print(f"Scraping {listing_type} page {page}: {url}")
-        try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"Error fetching JSON: {e}")
-            break
+    resp = requests.get(url)
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-        games = data.get("games", [])
-        if not games:
-            break
+    # Loop through each game card
+    game_cards = soup.select("div.game_cell")  # adjust selector if needed
+    for card in game_cards:
+        title_tag = card.select_one("a.title")
+        title = title_tag.text.strip() if title_tag else "Unknown"
+        game_url = title_tag['href'] if title_tag else ""
+        author_tag = card.select_one("div.author")
+        author = author_tag.text.strip() if author_tag else ""
+        price_tag = card.select_one("div.price")
+        price = price_tag.text.strip() if price_tag else "Free"
+        is_free = price.lower() == "free"
+        thumbnail_tag = card.select_one("img.cover")
+        thumbnail_url = thumbnail_tag['src'] if thumbnail_tag else ""
+        genre_tag = card.select_one("div.genre")
+        genre = genre_tag.text.strip() if genre_tag else ""
 
-        for game in games:
-            title = game.get("title", "Unknown")
-            game_url = game.get("url")
-            author = game.get("user", {}).get("username")
-            price_cents = game.get("price_cents", 0)
-            currency = game.get("currency")
-            is_free = game.get("free", True)
-            display_price = game.get("display_price", "")
-            genres = ", ".join([g["name"] for g in game.get("genres", [])])
-            thumbnail_url = game.get("cover_url")
-            thumbnail_path = download_thumbnail(thumbnail_url, title)
+        # Save thumbnail
+        thumb_path = ""
+        if thumbnail_url:
+            filename = f"{datetime.today().strftime('%Y-%m-%d')}_{title.replace(' ', '_')}.png"
+            thumb_path = os.path.join(THUMB_DIR, filename)
+            try:
+                r = requests.get(thumbnail_url)
+                with open(thumb_path, "wb") as f:
+                    f.write(r.content)
+            except Exception as e:
+                print(f"Failed to download thumbnail: {e}")
 
-            results.append({
-                "title": title,
-                "url": game_url,
-                "author": author,
-                "price": display_price,
-                "currency": currency,
-                "is_free": is_free,
-                "genre": genres,
-                "thumbnail_url": thumbnail_url,
-                "thumbnail_path": thumbnail_path,
-                "scrape_date": SCRAPE_DATE,
-                "listing_type": listing_type,
-                "source_page": f"{listing_type}_page_{page}"
-            })
-        page += 1
+        results.append({
+            "title": title,
+            "url": game_url,
+            "author": author,
+            "price": price,
+            "currency": "",  # could parse from price if needed
+            "is_free": is_free,
+            "genre": genre,
+            "thumbnail_url": thumbnail_url,
+            "thumbnail_path": thumb_path,
+            "scrape_date": datetime.today().strftime("%Y-%m-%d"),
+            "listing_type": listing_type,
+            "source_page": url.split("/")[-1]
+        })
+    
     return results
 
-# ---------- MAIN ----------
+# --- Main ---
 if __name__ == "__main__":
     all_results = []
-    for listing in LISTINGS:
-        all_results += scrape_listing(listing["type"], listing["url"])
+    for url, listing_type in [(POPULAR_URL, "popular"), (TOP_SELLERS_URL, "top_sellers")]:
+        try:
+            all_results += scrape_page(url, listing_type)
+        except Exception as e:
+            print(f"Error scraping {listing_type}: {e}")
 
-    if all_results:
-        df_new = pd.DataFrame(all_results)
-        if os.path.exists(CSV_FILE):
-            df_existing = pd.read_csv(CSV_FILE)
-            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-        else:
-            df_combined = df_new
-        df_combined.to_csv(CSV_FILE, index=False)
-        print(f"Scraped {len(all_results)} games. Saved to {CSV_FILE}")
-    else:
-        print("No games scraped.")
+    # Write CSV
+    keys = ["title","url","author","price","currency","is_free","genre","thumbnail_url","thumbnail_path","scrape_date","listing_type","source_page"]
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(all_results)
+
+    print(f"Scrape complete. CSV saved to {CSV_PATH}")
