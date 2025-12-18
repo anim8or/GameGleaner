@@ -23,7 +23,7 @@ jobs:
           pip install requests beautifulsoup4 pandas
 
       - name: Run scraper
-        run: python scraper/scrape_itch.py
+        run: python scraper/GameGleaner.py
 
       - name: Commit CSVs & thumbnails
         run: |
