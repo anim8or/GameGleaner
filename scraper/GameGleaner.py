@@ -1,85 +1,186 @@
-import os
 import requests
-import pandas as pd
 from bs4 import BeautifulSoup
-from datetime import date
+import pandas as pd
+import os
+import time
+from datetime import datetime
+from urllib.parse import urljoin
+from pathlib import Path
+import re
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-THUMB_DIR = os.path.join(DATA_DIR, "thumbnails")
-os.makedirs(THUMB_DIR, exist_ok=True)
+# =========================
+# CONFIG
+# =========================
 
 POPULAR_URL = "https://itch.io/games/popular"
 TOP_SELLERS_URL = "https://itch.io/games/top-sellers"
-CSV_FILE = os.path.join(DATA_DIR, "itch_games.csv")
 
-def download_thumbnail(url, title):
-    if not url:
-        return ""
-    ext = url.split(".")[-1].split("?")[0]
-    safe_title = "".join(c if c.isalnum() else "_" for c in title)
-    path = os.path.join(THUMB_DIR, f"{date.today().isoformat()}_{safe_title}.{ext}")
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            with open(path, "wb") as f:
-                f.write(r.content)
-            return path
-    except Exception as e:
-        print(f"Error downloading thumbnail for {title}: {e}")
-    return ""
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / "data"
+THUMBNAIL_DIR = DATA_DIR / "thumbnails"
+CSV_PATH = DATA_DIR / "itch_games.csv"
 
-def scrape_page(url, listing_type):
+HEADERS = {
+    "User-Agent": "GameGleanerBot/1.0 (research; respectful scraping)"
+}
+
+MAX_PAGES = 2
+REQUEST_DELAY = 1.5
+
+# =========================
+# UTILS
+# =========================
+
+def safe_text(el):
+    return el.get_text(strip=True) if el else None
+
+def ensure_dirs():
+    DATA_DIR.mkdir(exist_ok=True)
+    THUMBNAIL_DIR.mkdir(exist_ok=True)
+
+def parse_price(text):
+    if not text:
+        return 0, None, True
+
+    text = text.replace(",", "").strip()
+
+    if "Free" in text:
+        return 0, None, True
+
+    match = re.search(r"([£$€])\s*([\d.]+)", text)
+    if match:
+        symbol, amount = match.groups()
+        return float(amount), symbol, False
+
+    return 0, None, True
+
+# =========================
+# LISTING PAGE SCRAPER
+# =========================
+
+def scrape_listing_page(start_url, listing_type):
     results = []
-    page = 1
-    while url:
+    url = start_url
+
+    for page in range(1, MAX_PAGES + 1):
         print(f"Scraping {listing_type} page {page}: {url}")
-        r = requests.get(url)
-        soup = BeautifulSoup(r.text, "html.parser")
+        resp = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        game_cards = soup.select("div.game_cell, div.game_card")  # handle multiple class variants
-        for card in game_cards:
-            title_tag = card.select_one("a.game_title, a.title")
-            author_tag = card.select_one("div.game_author a")
-            thumb_tag = card.select_one("img.game_thumb, img.screenshot")
-            price_tag = card.select_one("div.price, span.price")
+        games = soup.select(".game_cell")
+        for game in games:
+            title_el = game.select_one(".title")
+            link_el = game.select_one("a")
 
-            title = title_tag.text.strip() if title_tag else "Unknown"
-            game_url = "https://itch.io" + title_tag["href"] if title_tag and title_tag.has_attr("href") else ""
-            author = author_tag.text.strip() if author_tag else ""
-            thumbnail_url = thumb_tag["src"] if thumb_tag and thumb_tag.has_attr("src") else ""
-            thumbnail_path = download_thumbnail(thumbnail_url, title) if thumbnail_url else ""
-            price = price_tag.text.strip() if price_tag else "Free"
+            title = safe_text(title_el) or "Unknown"
+            game_url = link_el["href"] if link_el and link_el.has_attr("href") else None
 
-            results.append({
-                "title": title,
-                "url": game_url,
-                "author": author,
-                "price": price,
-                "currency": "",  # optional: parse from price
-                "is_free": price.lower() == "free",
-                "genre": "",  # optional: extend scraper if genre info available
-                "thumbnail_url": thumbnail_url,
-                "thumbnail_path": thumbnail_path,
-                "scrape_date": date.today().isoformat(),
-                "listing_type": listing_type,
-                "source_page": f"{listing_type}_page_{page}"
-            })
+            if game_url:
+                results.append({
+                    "title": title,
+                    "url": game_url,
+                    "listing_type": listing_type,
+                    "source_page": f"{listing_type}_page_{page}",
+                    "scrape_date": datetime.utcnow().date().isoformat()
+                })
 
-        # next page
-        next_btn = soup.select_one("a.next, a.next_page")
-        url = "https://itch.io" + next_btn["href"] if next_btn and next_btn.has_attr("href") else None
-        page += 1
+        next_btn = soup.select_one("a.next_page")
+        url = next_btn["href"] if next_btn and next_btn.has_attr("href") else None
+        if not url:
+            break
+
+        time.sleep(REQUEST_DELAY)
+
     return results
 
-def main():
-    all_results = []
-    for url, listing_type in [(POPULAR_URL, "popular"), (TOP_SELLERS_URL, "top_sellers")]:
-        all_results += scrape_page(url, listing_type)
+# =========================
+# PER-GAME SCRAPER
+# =========================
 
-    df = pd.DataFrame(all_results)
-    df.to_csv(CSV_FILE, index=False)
-    print(f"Saved {len(all_results)} games to {CSV_FILE}")
+def scrape_game_page(game_url):
+    resp = requests.get(game_url, headers=HEADERS)
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Author
+    author = safe_text(soup.select_one(".game_author a"))
+
+    # Genre / tags
+    genres = [safe_text(t) for t in soup.select(".game_genre a")]
+    tags = [safe_text(t) for t in soup.select(".game_tags a")]
+    genre = "|".join(filter(None, set(genres + tags)))
+
+    # Price
+    price_el = soup.select_one(".price_value") or soup.select_one(".buy_btn")
+    price_text = safe_text(price_el)
+    price, currency, is_free = parse_price(price_text)
+
+    # Thumbnail
+    thumb_url = None
+    thumb_meta = soup.find("meta", property="og:image")
+    if thumb_meta and thumb_meta.has_attr("content"):
+        thumb_url = thumb_meta["content"]
+
+    thumb_path = None
+    if thumb_url:
+        filename = thumb_url.split("/")[-1].split("?")[0]
+        thumb_path = THUMBNAIL_DIR / filename
+        if not thumb_path.exists():
+            try:
+                img = requests.get(thumb_url, headers=HEADERS)
+                thumb_path.write_bytes(img.content)
+            except Exception:
+                thumb_path = None
+
+    return {
+        "author": author,
+        "price": price,
+        "currency": currency,
+        "is_free": is_free,
+        "genre": genre,
+        "thumbnail_url": thumb_url,
+        "thumbnail_path": str(thumb_path) if thumb_path else None
+    }
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    ensure_dirs()
+
+    rows = []
+    rows += scrape_listing_page(POPULAR_URL, "popular")
+    rows += scrape_listing_page(TOP_SELLERS_URL, "top_sellers")
+
+    df = pd.DataFrame(rows)
+    df.drop_duplicates(subset=["url", "listing_type"], inplace=True)
+
+    enriched = []
+    seen = set()
+
+    for _, row in df.iterrows():
+        if row["url"] in seen:
+            continue
+
+        seen.add(row["url"])
+        print(f"Enriching {row['url']}")
+        meta = scrape_game_page(row["url"])
+        enriched.append({**row, **meta})
+        time.sleep(REQUEST_DELAY)
+
+    final_df = pd.DataFrame(enriched)
+
+    if CSV_PATH.exists():
+        old = pd.read_csv(CSV_PATH)
+        final_df = pd.concat([old, final_df], ignore_index=True)
+
+    final_df.drop_duplicates(
+        subset=["url", "listing_type", "scrape_date"],
+        inplace=True
+    )
+
+    final_df.to_csv(CSV_PATH, index=False)
+    print(f"Saved {len(final_df)} rows to {CSV_PATH}")
 
 if __name__ == "__main__":
     main()
